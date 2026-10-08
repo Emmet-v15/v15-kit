@@ -20,7 +20,7 @@ the tool for signing those builds and the CI workflows for releasing them.
 # src-tauri/Cargo.toml
 [dependencies]
 tauri = { version = "=2.12.1", features = [] }
-v15-shell = { git = "https://github.com/Emmet-v15/v15-kit", tag = "v0.4.0" }
+v15-shell = { git = "https://github.com/Emmet-v15/v15-kit", tag = "v0.5.0" }
 ```
 
 ```rust
@@ -50,6 +50,18 @@ pub fn run() {
 
 `capabilities/default.json` lists `v15-shell:default`, and a page can call
 `invoke('plugin:v15-shell|info')` and `invoke('plugin:v15-shell|check')`.
+
+Other `Config` options:
+
+| option | does |
+|---|---|
+| `splash` | the update window: the kit's, the app's own page, or none |
+| `forward_launch` | arguments from a second launch reach the running copy as `LAUNCH_EVENT` |
+| `webview_dir` | the app's WebView2 folder, for the splash too |
+| `defender` | folders to exclude from Defender; the app calls `defender::ensure` |
+| `uninstall_entry` | retain the Apps & features entry from the older installer |
+| `relaunch_args`, `before_restart`, `restart_aborted` | carry state across an update |
+| `on_uninstall` | stop helpers before files go |
 
 ## Working on the kit
 

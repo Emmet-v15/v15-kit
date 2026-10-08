@@ -74,9 +74,13 @@ pub(crate) fn show<R: Runtime>(app: &AppHandle<R>, cfg: &Config, version: &str) 
         .and_then(|w| w.additional_browser_args.clone());
     let handle = app.clone();
     let title = cfg.name.to_string();
+    let webview_dir = cfg.webview_dir;
     let (tx, rx) = std::sync::mpsc::channel();
     let _ = app.run_on_main_thread(move || {
         let mut builder = WebviewWindowBuilder::new(&handle, LABEL, url);
+        if let Some(dir) = webview_dir {
+            builder = builder.data_directory(dir());
+        }
         #[cfg(windows)]
         if let Some(args) = &args {
             builder = builder.additional_browser_args(args);

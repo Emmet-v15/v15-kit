@@ -36,6 +36,7 @@
 //! platforms, the plugin retains its commands but performs no other actions.
 
 mod commands;
+pub mod defender;
 mod log;
 mod splash;
 mod update;
@@ -144,6 +145,10 @@ pub enum Splash {
 /// The splash window's label.
 pub const SPLASH_LABEL: &str = splash::LABEL;
 
+/// With `Config::forward_launch`, the event on which a second launch's
+/// arguments reach the running copy: a `Vec<String>` (the program name is omitted).
+pub const LAUNCH_EVENT: &str = "v15-shell://launch";
+
 pub struct Config {
     /// The app's name in its manifest and signatures, and in the names of its
     /// mutex and events: `[a-z0-9-]`.
@@ -175,6 +180,18 @@ pub struct Config {
     /// Runs on uninstall after the running copy has quit, before anything
     /// is removed (e.g. stopping a helper process the app started).
     pub on_uninstall: fn(),
+    /// Pass the arguments from a second launch to the running instance as
+    /// [`LAUNCH_EVENT`] rather than merely bringing its main window to the
+    /// front; the app then displays what it requires (a `myapp://` link, for
+    /// example).
+    pub forward_launch: bool,
+    /// The webview data folder for apps whose windows set their own; the
+    /// splash uses it too.
+    pub webview_dir: Option<fn() -> PathBuf>,
+    /// Folders that Microsoft Defender should leave alone (the app's data,
+    /// its downloads). The app calls `defender::ensure(false)` after
+    /// `pre_gui`: one UAC prompt for whatever is missing ([`defender`]).
+    pub defender: Option<fn() -> Vec<PathBuf>>,
     pub first_check: Duration,
     pub check_every: Duration,
     /// The window behind which an update downloads ([`Splash`]).
@@ -216,6 +233,9 @@ impl Config {
         uninstall_entry: "",
         remove_data_on_uninstall: true,
         on_uninstall: nothing,
+        forward_launch: false,
+        webview_dir: None,
+        defender: None,
         first_check: Duration::from_secs(4),
         check_every: Duration::from_secs(6 * 3600),
         splash: Splash::Builtin,
@@ -311,6 +331,16 @@ pub fn pre_gui(cfg: &'static Config) {
 /// The bootstrap is enabled for release builds that have not opted out.
 pub fn active() -> bool {
     !cfg!(debug_assertions) && std::env::var_os("V15_NO_BOOTSTRAP").is_none()
+}
+
+/// True in a build started by an update, until the build it replaces has
+/// exited. Apps that terminate older instances of themselves
+/// at startup must not do so during this time.
+pub fn handing_over() -> bool {
+    #[cfg(windows)]
+    return win::handing_over();
+    #[cfg(not(windows))]
+    false
 }
 
 /// Whether this is the installed copy (only that copy updates).

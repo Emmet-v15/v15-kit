@@ -30,6 +30,16 @@ same way.
 - [ ] **CI**: `.github/workflows/ci.yml` calls `tauri-ci.yml`, and a
   `release.yml` (workflow_dispatch) calls `tauri-release.yml`.
 
+## UI
+
+- **Custom, inline titlebar.** Windows are frameless (`decorations: false`)
+  with no native titlebar, drawing their own bar that includes a drag region
+  and window buttons within the app's design.
+- **Text is never verbose.** Labels, buttons, and messages use the fewest
+  words necessary to convey meaning.
+- **The update splash is the app's own** (`Splash::Page`): its mark is traced
+  as the download's progress bar.
+
 ## Naming
 
 | Thing | Pattern |

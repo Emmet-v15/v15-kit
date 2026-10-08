@@ -64,6 +64,10 @@ enum Cmd {
         /// Also write <file>.br and list it, to be served at <url>.br
         #[arg(long)]
         br: bool,
+        /// List this pre-packed file instead (it must unpack to the exe),
+        /// served at <url>.br
+        #[arg(long, conflicts_with = "br")]
+        br_file: Option<PathBuf>,
         #[arg(long, default_value = "")]
         notes: String,
         /// The live manifest to append to: a URL (404 = none yet) or a
@@ -133,6 +137,7 @@ fn run(cmd: Cmd) -> Result<()> {
             file,
             url,
             br,
+            br_file,
             notes,
             base,
             out,
@@ -155,7 +160,7 @@ fn run(cmd: Cmd) -> Result<()> {
             if manifest.app != app {
                 return Err(format!("the base manifest is {:?}'s, not {app:?}'s", manifest.app));
             }
-            let artifact = sign(&key, &app, &platform, build, &file, &url, br)?;
+            let artifact = sign(&key, &app, &platform, build, &file, &url, br, br_file.as_deref())?;
             eprintln!(
                 "signed {app} {platform} build {build}: {} bytes, sha256 {}",
                 artifact.size, artifact.sha256
@@ -255,7 +260,17 @@ fn load_key(path: Option<&Path>) -> Result<SigningKey> {
     SigningKey::from_pkcs8_pem(pem.trim()).map_err(|e| format!("not a PKCS#8 Ed25519 PEM key: {e}"))
 }
 
-fn sign(key: &SigningKey, app: &str, platform: &str, build: u64, file: &Path, url: &str, br: bool) -> Result<Artifact> {
+#[allow(clippy::too_many_arguments)]
+fn sign(
+    key: &SigningKey,
+    app: &str,
+    platform: &str,
+    build: u64,
+    file: &Path,
+    url: &str,
+    br: bool,
+    br_file: Option<&Path>,
+) -> Result<Artifact> {
     if !valid_name(app) || !valid_name(platform) {
         return Err(format!("app and platform must be [a-z0-9_-]: {app:?} {platform:?}"));
     }
@@ -270,7 +285,20 @@ fn sign(key: &SigningKey, app: &str, platform: &str, build: u64, file: &Path, ur
     }
     let sha256 = sha256_hex(&bytes);
     let sig = key.sign(signed_message(app, platform, build, bytes.len() as u64, &sha256).as_bytes());
-    let packed = if br {
+    let packed = if let Some(existing) = br_file {
+        let p = read(existing)?;
+        let mut back = Vec::with_capacity(bytes.len());
+        brotli_decompressor::Decompressor::new(&p[..], 64 * 1024)
+            .read_to_end(&mut back)
+            .map_err(|e| format!("{}: {e}", existing.display()))?;
+        if back != bytes {
+            return Err(format!("{} doesn't unpack to {}", existing.display(), file.display()));
+        }
+        Some(Packed {
+            url: format!("{url}.br"),
+            size: p.len() as u64,
+        })
+    } else if br {
         let out = PathBuf::from(format!("{}.br", file.display()));
         let p = pack(&bytes)?;
         write(&out, &p)?;
@@ -411,6 +439,7 @@ mod tests {
             &exe,
             "https://x/demo.exe",
             true,
+            None,
         )
         .unwrap();
         assert_eq!(a.br.as_ref().unwrap().url, "https://x/demo.exe.br");
@@ -427,9 +456,36 @@ mod tests {
             .unwrap();
         assert!(v15_update::matches(&unpacked, &c.artifact));
         assert!(
-            sign(&key, "demo", v15_update::ANDROID_ARM64, 1, &exe, "u", false).is_err(),
+            sign(&key, "demo", v15_update::ANDROID_ARM64, 1, &exe, "u", false, None).is_err(),
             "an exe isn't an apk"
         );
+        // an existing .br is listed as is, and only if it unpacks to the exe
+        let br = dir.join("demo.exe.br");
+        let again = sign(
+            &key,
+            "demo",
+            v15_update::WINDOWS_X64,
+            42,
+            &exe,
+            "https://x/demo.exe",
+            false,
+            Some(&br),
+        )
+        .unwrap();
+        assert_eq!(again.br.unwrap().size, packed.len() as u64);
+        std::fs::write(dir.join("other.br"), pack(b"MZ other").unwrap()).unwrap();
+        let other = dir.join("other.br");
+        assert!(sign(
+            &key,
+            "demo",
+            v15_update::WINDOWS_X64,
+            42,
+            &exe,
+            "u",
+            false,
+            Some(&other)
+        )
+        .is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

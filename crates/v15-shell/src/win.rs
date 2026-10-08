@@ -79,8 +79,9 @@ fn message(title: &str, text: &str) {
 
 // ---------- single instance ----------
 
-/// False when another instance holds the mutex (it has been asked to show).
-fn acquire(cfg: &Config) -> bool {
+/// False when another instance holds the mutex (it has been asked to show, and
+/// handed `forward`, a second launch's arguments, when the app wants them).
+fn acquire(cfg: &Config, forward: Option<&[String]>) -> bool {
     let (mutex, show, _) = names(cfg);
     let name = wide(&mutex);
     unsafe {
@@ -90,6 +91,9 @@ fn acquire(cfg: &Config) -> bool {
         }
         if GetLastError() == ERROR_ALREADY_EXISTS {
             CloseHandle(h);
+            if let (true, Some(args)) = (cfg.forward_launch, forward) {
+                post_launch(cfg, args);
+            }
             signal(&show);
             return false;
         }
@@ -135,6 +139,10 @@ fn held(cfg: &Config) -> bool {
 /// "Show yourself" (second launch) and "quit" (uninstall).
 fn watch_events<R: Runtime>(app: AppHandle<R>, cfg: &Config) {
     let (_, show, quit) = names(cfg);
+    let (forward, mailbox) = (cfg.forward_launch, launch_dir(cfg));
+    if forward {
+        deliver_launches(&app, &mailbox); // any that arrived while this one was starting
+    }
     thread::spawn(move || unsafe {
         let (s, q) = (wide(&show), wide(&quit));
         let handles = [
@@ -147,8 +155,12 @@ fn watch_events<R: Runtime>(app: AppHandle<R>, cfg: &Config) {
         loop {
             match WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) {
                 r if r == WAIT_OBJECT_0 => {
-                    let a = app.clone();
-                    let _ = app.run_on_main_thread(move || crate::show(&a));
+                    if forward {
+                        deliver_launches(&app, &mailbox);
+                    } else {
+                        let a = app.clone();
+                        let _ = app.run_on_main_thread(move || crate::show(&a));
+                    }
                 }
                 r if r == WAIT_OBJECT_0 + 1 => {
                     app.exit(0);
@@ -158,6 +170,53 @@ fn watch_events<R: Runtime>(app: AppHandle<R>, cfg: &Config) {
             }
         }
     });
+}
+
+/// Second launch arguments wait here, one per file, until the running copy
+/// reads them: alongside the logs, organized per user (or under
+/// V15_TEST_ROOT).
+fn launch_dir(cfg: &Config) -> PathBuf {
+    cfg.log_dir().with_file_name("launch")
+}
+
+fn post_launch(cfg: &Config, args: &[String]) {
+    let dir = launch_dir(cfg);
+    let _ = fs::create_dir_all(&dir);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let name = format!("{nanos:024}-{}", std::process::id());
+    let tmp = dir.join(format!("{name}.tmp"));
+    // written in full, then renamed: the reader never sees a partial file
+    let written = fs::write(&tmp, serde_json::to_vec(args).unwrap_or_default())
+        .and_then(|_| fs::rename(&tmp, dir.join(format!("{name}.json"))));
+    if let Err(e) = written {
+        log(format!("could not hand the launch over: {e}"));
+    }
+}
+
+fn deliver_launches<R: Runtime>(app: &AppHandle<R>, dir: &Path) {
+    use tauri::Emitter;
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    files.sort();
+    for f in files {
+        let args = fs::read(&f)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Vec<String>>(&b).ok());
+        let _ = fs::remove_file(&f);
+        if let Some(args) = args {
+            let _ = app.emit(crate::LAUNCH_EVENT, args);
+        }
+    }
+}
+
+pub(crate) fn handing_over() -> bool {
+    PREDECESSOR.load(Ordering::SeqCst) != 0
 }
 
 // ---------- before the GUI ----------
@@ -175,7 +234,7 @@ pub(crate) fn pre_gui(cfg: &'static Config) {
     if let Some(pid) = predecessor {
         PREDECESSOR.store(pid, Ordering::SeqCst);
     }
-    if !acquire(cfg) {
+    if !acquire(cfg, Some(&args[1..])) {
         std::process::exit(0);
     }
     let Ok(exe) = std::env::current_exe() else { return };
@@ -473,7 +532,7 @@ pub(crate) fn apply<R: Runtime>(
         Err(e) => {
             unsafe { CloseHandle(event) };
             let _ = fs::rename(&exe, &failed).and_then(|_| fs::rename(&old, &exe));
-            acquire(cfg);
+            acquire(cfg, None);
             (cfg.restart_aborted)();
             return Err(format!("starting build {}: {e}", c.build));
         }
@@ -501,7 +560,7 @@ pub(crate) fn apply<R: Runtime>(
     let _ = fs::remove_file(&failed);
     let restored = retry(|| fs::rename(&exe, &failed)).and_then(|_| retry(|| fs::rename(&old, &exe)));
     skip(cfg, c.build);
-    acquire(cfg);
+    acquire(cfg, None);
     show_windows(app, shown);
     (cfg.restart_aborted)();
     match restored {
