@@ -37,8 +37,9 @@ same way.
   and window buttons within the app's design.
 - **Text is never verbose.** Labels, buttons, and messages use the fewest
   words necessary to convey meaning.
-- **The update splash is the app's own** (`Splash::Page`): its mark is traced
-  as the download's progress bar.
+- **The update splash is the app's own** (`Splash::Page`): its mark, sourced
+  from the icon, is traced in lines clockwise to serve as the download's
+  progress bar (UPDATER.md, "The splash").
 
 ## Naming
 

@@ -36,6 +36,15 @@ The page defines `window.progress(fraction)`; the download calls it from 0 to
 (e.g. dragging). It opens with the main window's `additionalBrowserArgs`,
 because WebView2 won't create a second window whose arguments differ.
 
+To draw the page, trace the app's mark, derived from its icon source (same
+shapes and colors, rendered as lines), clockwise from the top, where the
+stroke length corresponds to the fraction. An SVG using `viewBox` scales
+uniformly. A `<canvas>` does not: set its pixel buffer using both
+`clientWidth` and `clientHeight` (multiplied by `devicePixelRatio`), check
+both each frame, and then scale the drawing by the smaller ratio. A canvas
+left at the default 300×150 buffer stretches to its CSS box, causing a circle
+to render as an oval.
+
 ## The manifest
 
 ```json
