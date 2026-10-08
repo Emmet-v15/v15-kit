@@ -1,0 +1,18 @@
+[package]
+name = "v15-release"
+description = "Signs v15 app builds and writes their update manifests (CI and local)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+v15-update.workspace = true
+ed25519-dalek = { workspace = true, features = ["pkcs8", "pem"] }
+serde_json.workspace = true
+ureq.workspace = true
+brotli.workspace = true
+brotli-decompressor.workspace = true
+clap = { version = "4.6", features = ["derive"] }
+getrandom = "0.3"

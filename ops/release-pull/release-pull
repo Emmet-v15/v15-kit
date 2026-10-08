@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+"""release-pull: install one GitHub release's files on this server.
+
+CI builds an app and publishes its files as a GitHub release, then asks this
+server to install that release over SSH, with a key that can do nothing else:
+
+    ~/.ssh/authorized_keys
+      command="/usr/local/bin/release-pull myapp",restrict ssh-ed25519 AAAA… myapp-ci
+    CI
+      echo "$GITHUB_TOKEN" | ssh deploy@server myapp-1790819890
+      echo "$GITHUB_TOKEN" | ssh deploy@server check myapp-1790819890
+                                            fetch and verify, install nothing
+
+The key fixes the app; the release tag is all CI chooses. What a release may
+put where, and what runs afterwards, is the app's config on this server
+(/etc/release-pull/<app>.json), never the release's:
+
+    {
+      "repo": "owner/name",                 GitHub repo the releases are in
+      "tag": "^myapp-[0-9]+$",              tags it may install
+      "token": "stdin",                     private repos: the caller sends
+                                            a token on stdin (CI's own, read
+                                            only, gone when the run ends), or
+                                            a file holding one; leave out for
+                                            public repos
+      "files": [                            installed in this order
+        {"asset": "app.exe", "to": "/var/www/site/app.exe", "owner": "nginx:nginx"},
+        {"asset": "web.tar.gz", "replace": "/var/www/app.site", "owner": "nginx:nginx"},
+        {"asset": "tools.tar.gz", "unpack": "/home/deploy", "owner": "deploy:deploy"}
+      ],
+      "remove": ["/var/www/site/old-file"], deleted afterwards, if there
+      "after": [["systemctl", "restart", "app.service"]]   run last, in order
+    }
+
+  to       one file, swapped in atomically (a temp file beside it, renamed)
+  replace  a .tar.gz becomes the folder's whole contents (built beside it,
+           swapped in; what was there goes)
+  unpack   a .tar.gz extracted into the folder, over what is there
+
+Whoever holds the key gets only what GitHub serves for the configured repo
+under an allowed tag: a token they send can let release-pull read, never
+change what it reads.
+
+Every asset it installs must be in the release's SHA256SUMS (sha256sum's
+format) and match. Archives are extracted with Python's "data" filter: no
+absolute paths, no "..", no links out, no device files or setuid bits.
+List manifests and version files last: clients see a new build only once its
+files are in place.
+
+Run by hand (as a sudoer):
+    release-pull <app> <tag>                  what CI does
+    release-pull <app> <tag> --assets DIR     the files from DIR (and its
+                                              SHA256SUMS), not GitHub; a
+                                              file may be there as <name>.br
+                                              (unpacked, then checked)
+    release-pull <app> <tag> --check          fetch and verify only
+A tag is reinstalled as readily as a new one, so installing an older release
+rolls back to it.
+
+Each run is logged to /var/log/release-pull.log as well as printed.
+"""
+
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.request
+
+CONFIG_DIR = "/etc/release-pull"
+LOG = "/var/log/release-pull.log"
+SUMS = "SHA256SUMS"
+
+
+class Refused(Exception):
+    pass
+
+
+def log(msg):
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    try:
+        with open(LOG, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def parse_args(argv):
+    # The forced command names the app. CI's own command line (the tag, or
+    # "check" and the tag) arrives in SSH_ORIGINAL_COMMAND, and nothing else
+    # does.
+    if not argv:
+        raise Refused("usage: release-pull <app> [<tag>] [--assets DIR] [--check]")
+    app, rest = argv[0], argv[1:]
+    original = os.environ.get("SSH_ORIGINAL_COMMAND")
+    if original is not None:
+        if rest:
+            raise Refused("a forced command names only the app")
+        words = original.split()
+        if len(words) == 2 and words[0] == "check":
+            return app, words[1], None, True
+        if len(words) != 1:
+            raise Refused("send just the release tag (or: check <tag>)")
+        return app, words[0], None, False
+    check = "--check" in rest
+    rest = [w for w in rest if w != "--check"]
+    assets = None
+    if "--assets" in rest:
+        i = rest.index("--assets")
+        if i + 1 >= len(rest):
+            raise Refused("--assets needs a folder")
+        assets = os.path.abspath(rest[i + 1])
+        rest = rest[:i] + rest[i + 2:]
+    if len(rest) != 1:
+        raise Refused("usage: release-pull <app> <tag> [--assets DIR] [--check]")
+    return app, rest[0], assets, check
+
+
+def load_config(app):
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", app):
+        raise Refused(f"not an app name: {app!r}")
+    path = os.path.join(CONFIG_DIR, app + ".json")
+    try:
+        with open(path) as f:
+            conf = json.load(f)
+    except FileNotFoundError:
+        raise Refused(f"no config for {app} ({path})")
+    for key in ("repo", "tag", "files"):
+        if key not in conf:
+            raise Refused(f"{path}: missing {key!r}")
+    for entry in conf["files"]:
+        modes = [m for m in ("to", "replace", "unpack") if m in entry]
+        if "asset" not in entry or len(modes) != 1:
+            raise Refused(f"{path}: each file needs an asset and one of to/replace/unpack: {entry}")
+        if not os.path.isabs(entry[modes[0]]):
+            raise Refused(f"{path}: not an absolute path: {entry[modes[0]]}")
+    return conf
+
+
+# ── GitHub ──────────────────────────────────────────────────────────────────
+
+def github(url, token, accept="application/vnd.github+json"):
+    req = urllib.request.Request(url, headers={"Accept": accept, "User-Agent": "release-pull",
+                                               "X-GitHub-Api-Version": "2022-11-28"})
+    if token:
+        # Unredirected: asset downloads redirect to storage that rejects the
+        # header.
+        req.add_unredirected_header("Authorization", f"Bearer {token}")
+    return urllib.request.urlopen(req, timeout=60)
+
+
+def github_token(conf):
+    source = conf.get("token")
+    if not source:
+        return None
+    if source == "stdin":
+        token = sys.stdin.readline(4096).strip()
+        if not token:
+            raise Refused("send a GitHub token on stdin (this repo is private)")
+    else:
+        try:
+            with open(source) as f:
+                token = f.read().strip()
+        except OSError as e:
+            raise Refused(f"cannot read the GitHub token: {e}")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", token):
+        raise Refused("that is not a GitHub token")
+    return token
+
+
+def fetch_release(conf, tag, wanted, workdir):
+    token = github_token(conf)
+    api = f"https://api.github.com/repos/{conf['repo']}"
+    try:
+        with github(f"{api}/releases/tags/{tag}", token) as r:
+            release = json.load(r)
+    except urllib.error.HTTPError as e:
+        raise Refused(f"release {tag} of {conf['repo']}: HTTP {e.code}")
+    assets = {a["name"]: a for a in release.get("assets", [])}
+    for name in sorted(wanted):
+        if name not in assets:
+            raise Refused(f"release {tag} has no {name}")
+        t = time.time()
+        with github(f"{api}/releases/assets/{assets[name]['id']}", token, "application/octet-stream") as r, \
+                open(os.path.join(workdir, name), "wb") as out:
+            shutil.copyfileobj(r, out, 1 << 20)
+        size = os.path.getsize(os.path.join(workdir, name))
+        if size != assets[name]["size"]:
+            raise Refused(f"{name}: got {size} bytes, the release says {assets[name]['size']}")
+        log(f"  fetched {name} ({size} bytes, {time.time() - t:.1f} s)")
+
+
+def copy_assets(src, wanted, workdir):
+    for name in sorted(wanted):
+        path = os.path.join(src, name)
+        if os.path.isfile(path):
+            shutil.copyfile(path, os.path.join(workdir, name))
+        elif os.path.isfile(path + ".br"):
+            unbrotli(path + ".br", os.path.join(workdir, name))
+            log(f"  unpacked {name}.br ({os.path.getsize(os.path.join(workdir, name))} bytes)")
+        else:
+            raise Refused(f"{src} has no {name}")
+
+
+def unbrotli(src, dest):
+    # Any asset might arrive compressed with brotli as <name>.br (a slow
+    # uplink sends only that); SHA256SUMS still lists the unpacked file.
+    # Node's zlib handles brotli; Python's standard library does not.
+    node = shutil.which("node") or "/usr/local/bin/node"
+    subprocess.run([node, "-e", "const z=require('zlib'),fs=require('fs');"
+                    "require('stream').pipeline(fs.createReadStream(process.argv[1]),z.createBrotliDecompress(),"
+                    "fs.createWriteStream(process.argv[2]),e=>{if(e){console.error(e.message);process.exit(1)}})",
+                    src, dest], check=True)
+
+
+def verify(workdir, names):
+    sums = {}
+    with open(os.path.join(workdir, SUMS)) as f:
+        for line in f:
+            m = re.fullmatch(r"([0-9a-fA-F]{64}) [ *](.+)", line.rstrip("\r\n"))
+            if m:
+                sums[m.group(2)] = m.group(1).lower()
+    for name in sorted(names):
+        if name not in sums:
+            raise Refused(f"{name} is not in {SUMS}")
+        h = hashlib.sha256()
+        with open(os.path.join(workdir, name), "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        if h.hexdigest() != sums[name]:
+            raise Refused(f"{name} does not match {SUMS}")
+
+
+# ── installing ──────────────────────────────────────────────────────────────
+
+def chown_tree(path, owner):
+    if not owner:
+        return
+    user, _, group = owner.partition(":")
+    shutil.chown(path, user, group or None)
+    if os.path.isdir(path) and not os.path.islink(path):
+        for root, dirs, files in os.walk(path):
+            for n in dirs + files:
+                shutil.chown(os.path.join(root, n), user, group or None)
+
+
+def install_file(src, dest, owner):
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    # Writes to the destination folder, so it inherits that folder's
+    # SELinux label, and the rename is atomic.
+    tmp = os.path.join(os.path.dirname(dest), f".{os.path.basename(dest)}.release-pull")
+    shutil.copyfile(src, tmp)
+    os.chmod(tmp, 0o644)
+    chown_tree(tmp, owner)
+    os.replace(tmp, dest)
+
+
+def extract(archive, into):
+    with tarfile.open(archive, "r:*") as t:
+        t.extractall(into, filter="data")
+        return [m.name for m in t.getmembers()]
+
+
+def replace_dir(archive, dest, owner):
+    parent, name = os.path.split(dest.rstrip("/"))
+    os.makedirs(parent, exist_ok=True)
+    new, old = os.path.join(parent, f".{name}.new"), os.path.join(parent, f".{name}.old")
+    for leftover in (new, old):
+        shutil.rmtree(leftover, ignore_errors=True)
+    os.mkdir(new, 0o755)
+    try:
+        extract(archive, new)
+        if os.path.isdir(dest):
+            shutil.copystat(dest, new)  # the folder keeps its mode
+        chown_tree(new, owner)
+    except BaseException:
+        shutil.rmtree(new, ignore_errors=True)
+        raise
+    if os.path.exists(dest):
+        os.rename(dest, old)
+    os.rename(new, dest)
+    shutil.rmtree(old, ignore_errors=True)
+
+
+def unpack_into(archive, dest, owner):
+    os.makedirs(dest, exist_ok=True)
+    for member in extract(archive, dest):
+        if owner:  # what the archive brought, not the rest of the folder
+            user, _, group = owner.partition(":")
+            shutil.chown(os.path.join(dest, member), user, group or None)
+
+
+def relabel(paths):
+    if shutil.which("restorecon"):
+        # Best effort: Paths outside SELinux's file contexts are unlabeled.
+        subprocess.run(["restorecon", "-R", *paths], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def run(app, tag, assets_dir, check):
+    conf = load_config(app)
+    if not re.fullmatch(conf["tag"], tag):
+        raise Refused(f"{tag!r} is not a {app} release tag ({conf['tag']})")
+    lock = open(f"/run/lock/release-pull-{app}.lock", "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    t0 = time.time()
+    log(f"{app}: {'checking' if check else 'installing'} {tag} from {assets_dir or conf['repo']}")
+    names = {e["asset"] for e in conf["files"]}
+    workdir = tempfile.mkdtemp(prefix=f"release-pull-{app}-", dir="/var/tmp")
+    try:
+        if assets_dir:
+            copy_assets(assets_dir, names | {SUMS}, workdir)
+        else:
+            fetch_release(conf, tag, names | {SUMS}, workdir)
+        verify(workdir, names)
+        if check:
+            log(f"{app}: {tag} checks out ({len(names)} files match {SUMS}); nothing installed, {time.time() - t0:.1f} s")
+            return
+        touched = []
+        for e in conf["files"]:
+            src, owner = os.path.join(workdir, e["asset"]), e.get("owner")
+            if "to" in e:
+                install_file(src, e["to"], owner)
+                touched.append(e["to"])
+            elif "replace" in e:
+                replace_dir(src, e["replace"], owner)
+                touched.append(e["replace"])
+            else:
+                unpack_into(src, e["unpack"], owner)
+            log(f"  {e['asset']} -> {e.get('to') or e.get('replace') or e.get('unpack')}")
+        relabel(touched)
+        for path in conf.get("remove", []):
+            if os.path.lexists(path):
+                os.remove(path)
+                log(f"  removed {path}")
+        for cmd in conf.get("after", []):
+            log(f"  running {' '.join(cmd)}")
+            subprocess.run(cmd, check=True)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    log(f"{app}: {tag} installed in {time.time() - t0:.1f} s")
+
+
+def main():
+    try:
+        app, tag, assets_dir, check = parse_args(sys.argv[1:])
+        if os.geteuid() != 0:
+            # Validated above; root from here on (the arguments, not the
+            # environment, carry the tag across sudo; stdin, a token).
+            cmd = ["sudo", "-n", os.path.abspath(sys.argv[0]), app, tag] + (["--assets", assets_dir] if assets_dir else [])
+            cmd += ["--check"] if check else []
+            env = {k: v for k, v in os.environ.items() if k != "SSH_ORIGINAL_COMMAND"}
+            os.execvpe("sudo", cmd, env)
+        run(app, tag, assets_dir, check)
+    except Refused as e:
+        log(f"refused: {e}")
+        sys.exit(2)
+    except Exception as e:  # noqa: BLE001 - CI shows this line
+        log(f"failed: {type(e).__name__}: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

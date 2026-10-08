@@ -1,0 +1,4 @@
+/target/
+# signing keys never live in a repo (docs/UPDATER.md)
+*.pem
+state/

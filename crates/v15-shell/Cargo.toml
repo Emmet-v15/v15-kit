@@ -1,0 +1,29 @@
+[package]
+name = "v15-shell"
+description = "The v15 app shell for Tauri: self-install, one instance, signed self-update"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+links = "tauri-plugin-v15-shell"
+build = "build.rs"
+
+[dependencies]
+v15-update.workspace = true
+tauri.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+brotli-decompressor.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Threading",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+tauri-plugin.workspace = true

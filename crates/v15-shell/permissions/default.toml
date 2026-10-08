@@ -1,0 +1,5 @@
+"$schema" = "schemas/schema.json"
+
+[default]
+description = "Lets the app's pages read its build info and ask for an update check."
+permissions = ["allow-info", "allow-check"]

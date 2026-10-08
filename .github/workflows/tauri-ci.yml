@@ -1,0 +1,40 @@
+name: tauri-ci
+
+# A quick check for an app built on v15-kit. Call it from the app's own
+# ci.yml:
+#
+#   jobs:
+#     test:
+#       uses: Emmet-v15/v15-kit/.github/workflows/tauri-ci.yml@v0.4.0
+#
+# Builds and tests the app's Cargo workspace.
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        type: string
+        default: windows-latest
+      working-directory:
+        type: string
+        default: .
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  test:
+    runs-on: ${{ inputs.runs-on }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ inputs.working-directory }}
+      - run: cargo test --workspace --locked

@@ -1,0 +1,239 @@
+name: tauri-release
+
+# One release of an app built on v15-kit (docs/UPDATER.md), invoked from the
+# app's own release.yml:
+#
+#   on: workflow_dispatch
+#   jobs:
+#     release:
+#       uses: Emmet-v15/v15-kit/.github/workflows/tauri-release.yml@v0.4.0
+#       with:
+#         app: myapp
+#         package: myapp-app
+#         exe: myapp.exe
+#         pubkey: <the hex key in the app's Config.pubkeys>
+#         site: https://example.com/myapp
+#         pull-host: files.example.com
+#         pull-user: deploy
+#         pull-host-key: "files.example.com ssh-ed25519 AAAA..."
+#       secrets:
+#         V15_UPDATE_KEY: ${{ secrets.V15_UPDATE_KEY }}
+#         RELEASE_PULL_KEY: ${{ secrets.RELEASE_PULL_KEY }}
+#       permissions:
+#         contents: write
+#
+# 1. build: a Windows runner builds the exe with V15_BUILD_ID (epoch
+#    seconds), signs it into the live manifest plus this build (v15-release
+#    add, which refuses a key the app doesn't trust), packs the .br and
+#    writes SHA256SUMS.
+# 2. release: the GitHub release <app>-<build> contains the files; the
+#    newest 5
+#    are kept.
+# 3. install: the server's release-pull (ops/release-pull) fetches that
+#    release with this run's read-only token and puts the files where its
+#    config for the app says; then the live manifest at <site>/manifest.json
+#    is checked.
+#
+# Secrets: V15_UPDATE_KEY (the app's signing key, PEM) and RELEASE_PULL_KEY
+# (an SSH key that can only run `release-pull <app>` on the server).
+#
+# GitHub won't let a run's token tag a commit that modifies a workflow, so
+# such a commit can't be released from CI; the build job stops early.
+
+on:
+  workflow_call:
+    inputs:
+      app:
+        type: string
+        required: true
+      package:
+        description: The cargo package that builds the app
+        type: string
+        required: true
+      exe:
+        description: Its exe in target/release, and the name it is served as
+        type: string
+        required: true
+      pubkey:
+        description: The hex key the app trusts (Config.pubkeys)
+        type: string
+        required: true
+      site:
+        description: Where the app's files are served (<site>/manifest.json, <site>/<exe>)
+        type: string
+        required: true
+      pull-host:
+        description: The server that runs release-pull (needed to publish)
+        type: string
+        default: ""
+      pull-user:
+        type: string
+        default: ""
+      pull-host-key:
+        description: The server's known_hosts line
+        type: string
+        default: ""
+      working-directory:
+        type: string
+        default: .
+      kit-ref:
+        description: The v15-kit tag whose v15-release signs
+        type: string
+        default: v0.4.0
+      notes:
+        type: string
+        default: ""
+      publish:
+        description: Install it on the server (off = build and release only)
+        type: boolean
+        default: true
+    secrets:
+      V15_UPDATE_KEY:
+        required: true
+      RELEASE_PULL_KEY:
+        required: false
+    outputs:
+      tag:
+        value: ${{ jobs.build.outputs.tag }}
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.stamp.outputs.tag }}
+      build: ${{ steps.stamp.outputs.build }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Defender off (a throwaway runner)
+        shell: pwsh
+        working-directory: .
+        run: |
+          try { Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction Stop } catch { "Defender stays on: $_" }
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+      - name: the release can be tagged
+        run: |
+          if ! git diff --quiet HEAD~1 HEAD -- "$(git rev-parse --show-toplevel)/.github/workflows" 2>/dev/null; then
+            echo "::error::$(git log -1 --format=%h) edits a workflow, and GitHub won't let CI tag it: commit anything else on top"
+            exit 1
+          fi
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ inputs.working-directory }}
+          shared-key: release
+      - uses: actions/cache@v4
+        with:
+          path: ~/.v15-release
+          key: v15-release-${{ inputs.kit-ref }}-${{ runner.os }}
+      - name: v15-release ${{ inputs.kit-ref }}
+        run: |
+          [ -x ~/.v15-release/bin/v15-release ] || \
+            cargo install --locked --git https://github.com/Emmet-v15/v15-kit --tag "${{ inputs.kit-ref }}" --root ~/.v15-release v15-release
+          echo "$HOME/.v15-release/bin" >> "$GITHUB_PATH"
+      - name: stamp
+        id: stamp
+        run: |
+          if [ -n "${V15_TEST_MANIFEST_URL:-}${V15_TEST_PUBKEY:-}" ]; then echo "::error::a V15_TEST_* stamp would ship in the build"; exit 1; fi
+          build=$(date +%s)
+          echo "V15_BUILD_ID=$build" >> "$GITHUB_ENV"
+          { echo "build=$build"; echo "tag=${{ inputs.app }}-$build"; } >> "$GITHUB_OUTPUT"
+      - name: build
+        run: cargo build --release --locked -p "${{ inputs.package }}"
+      - name: sign
+        env:
+          V15_UPDATE_KEY: ${{ secrets.V15_UPDATE_KEY }}
+          APP: ${{ inputs.app }}
+          EXE: ${{ inputs.exe }}
+          SITE: ${{ inputs.site }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          target=$(cygpath -u "$(cargo metadata --no-deps --format-version 1 | jq -r .target_directory)")
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r --arg p "${{ inputs.package }}" '.packages[] | select(.name == $p) | .version')
+          mkdir -p "$RUNNER_TEMP/out"
+          cp "$target/release/$EXE" "$RUNNER_TEMP/out/$EXE"
+          cd "$RUNNER_TEMP/out"
+          v15-release add --app "$APP" --platform windows-x86_64 --build "$V15_BUILD_ID" --version "$version" \
+            --file "$EXE" --url "$SITE/$EXE" --br --notes "$NOTES" \
+            --base "$SITE/manifest.json" --out manifest.json \
+            --expect-pubkey "${{ inputs.pubkey }}"
+          v15-release verify --manifest manifest.json --app "$APP" --platform windows-x86_64 \
+            --pubkey "${{ inputs.pubkey }}" --current $((V15_BUILD_ID - 1)) --file "$EXE"
+          v15-release sums --out SHA256SUMS "$EXE" "$EXE.br" manifest.json
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: ${{ runner.temp }}/out/
+          retention-days: 1
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: out
+      - name: publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.build.outputs.tag }}
+          APP: ${{ inputs.app }}
+        run: |
+          gh release create "$TAG" out/* --target "$GITHUB_SHA" \
+            --title "$APP ${{ needs.build.outputs.build }}" \
+            --notes "Built from ${GITHUB_REF_NAME} at ${GITHUB_SHA}. ${{ inputs.notes }}" --latest=false
+          # Retain the latest 5. Reinstalling an older version only affects
+          # future downloads; already installed apps remain unchanged.
+          gh release list --limit 100 --json tagName -q '.[].tagName' \
+            | grep -E "^${APP}-[0-9]+$" | sort -t- -k2 -rn | tail -n +6 \
+            | while read -r old; do gh release delete "$old" --cleanup-tag -y; done
+
+  install:
+    needs: [build, release]
+    if: inputs.publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read # the token release-pull fetches the release with
+    env:
+      TAG: ${{ needs.build.outputs.tag }}
+    steps:
+      - name: install on the server
+        env:
+          PULL_KEY: ${{ secrets.RELEASE_PULL_KEY }}
+          HOST: ${{ inputs.pull-host }}
+          USER_NAME: ${{ inputs.pull-user }}
+          HOST_KEY: ${{ inputs.pull-host-key }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          [ -n "$PULL_KEY" ] && [ -n "$HOST" ] && [ -n "$USER_NAME" ] && [ -n "$HOST_KEY" ] \
+            || { echo "::error::publishing needs RELEASE_PULL_KEY, pull-host, pull-user and pull-host-key"; exit 1; }
+          mkdir -p ~/.ssh
+          printf '%s\n' "$PULL_KEY" > ~/.ssh/pull_key
+          chmod 600 ~/.ssh/pull_key
+          printf '%s\n' "$HOST_KEY" > ~/.ssh/known_hosts
+          # The token is passed via stdin, not the command line, and expires when
+          # this run ends.
+          printf '%s\n' "$GITHUB_TOKEN" | ssh -i ~/.ssh/pull_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes "$USER_NAME@$HOST" "$TAG"
+      - name: verify
+        env:
+          SITE: ${{ inputs.site }}
+        run: |
+          latest=$(curl -fsS "$SITE/manifest.json" | jq -r .latest)
+          [ "$latest" = "${{ needs.build.outputs.build }}" ] || { echo "::error::the live manifest's latest is $latest"; exit 1; }
+          echo "live: ${{ inputs.app }} build $latest"
