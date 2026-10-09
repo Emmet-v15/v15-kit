@@ -6,7 +6,7 @@ name: tauri-release
 #   on: workflow_dispatch
 #   jobs:
 #     release:
-#       uses: Emmet-v15/v15-kit/.github/workflows/tauri-release.yml@v0.5.0
+#       uses: Emmet-v15/v15-kit/.github/workflows/tauri-release.yml@v0.5.1
 #       with:
 #         app: myapp
 #         package: myapp-app
@@ -22,14 +22,15 @@ name: tauri-release
 #       permissions:
 #         contents: write
 #
-# 1. build: a Windows runner builds the exe with V15_BUILD_ID (epoch
-#    seconds), signs it into the live manifest plus this build (v15-release
-#    add, which refuses a key the app doesn't trust), packs the .br and
-#    writes SHA256SUMS.
-# 2. release: the GitHub release <app>-<build> contains the files; the
-#    newest 5
-#    are kept.
-# 3. install: the server's release-pull (ops/release-pull) fetches that
+# 1. tag: selects the build id (epoch seconds) and creates the GitHub release
+#    <app>-<build> at once, empty and marked prerelease, so its tag exists
+#    before the build starts.
+# 2. build: a Windows runner builds the exe with that V15_BUILD_ID and signs
+#    it into the live manifest plus this build (v15-release add, which refuses
+#    a key the app doesn't trust), packs the .br and writes SHA256SUMS.
+# 3. release: uploads the files to that release and publishes it; the
+#    newest 5 are kept. A failed build removes the empty release.
+# 4. install: the server's release-pull (ops/release-pull) fetches that
 #    release with this run's read-only token and puts the files where its
 #    config for the app says; then the live manifest at <site>/manifest.json
 #    is checked.
@@ -37,8 +38,11 @@ name: tauri-release
 # Secrets: V15_UPDATE_KEY (the app's signing key, PEM) and RELEASE_PULL_KEY
 # (an SSH key that can only run `release-pull <app>` on the server).
 #
-# GitHub won't let a run's token tag a commit that modifies a workflow, so
-# such a commit can't be released from CI; the build job stops early.
+# GitHub prevents a run's token from creating a tag on a commit if its
+# workflow files differ from the default branch's: a commit that edits a
+# workflow, or one the branch has since moved past with a workflow edit.
+# The tag is created first, before main can move on during the build, and a
+# commit that edits a workflow stops there.
 
 on:
   workflow_call:
@@ -79,7 +83,7 @@ on:
       kit-ref:
         description: The v15-kit tag whose v15-release signs
         type: string
-        default: v0.5.0
+        default: v0.5.1
       notes:
         type: string
         default: ""
@@ -94,7 +98,7 @@ on:
         required: false
     outputs:
       tag:
-        value: ${{ jobs.build.outputs.tag }}
+        value: ${{ jobs.tag.outputs.tag }}
 
 permissions: {}
 
@@ -102,13 +106,40 @@ env:
   CARGO_TERM_COLOR: never
 
 jobs:
+  tag:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      build: ${{ steps.tag.outputs.build }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+      - name: the release can be tagged
+        run: |
+          if ! git diff --quiet HEAD~1 HEAD -- .github/workflows 2>/dev/null; then
+            echo "::error::$(git log -1 --format=%h) edits a workflow, and GitHub won't let CI tag it: commit anything else on top"
+            exit 1
+          fi
+      - name: the release, empty until the build is in
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          APP: ${{ inputs.app }}
+        run: |
+          build=$(date +%s)
+          gh release create "$APP-$build" --target "$GITHUB_SHA" --prerelease --latest=false \
+            --title "$APP $build (building)" --notes "Building from ${GITHUB_REF_NAME} at ${GITHUB_SHA}."
+          { echo "build=$build"; echo "tag=$APP-$build"; } >> "$GITHUB_OUTPUT"
+
   build:
+    needs: tag
     runs-on: windows-latest
     permissions:
       contents: read
-    outputs:
-      tag: ${{ steps.stamp.outputs.tag }}
-      build: ${{ steps.stamp.outputs.build }}
     defaults:
       run:
         shell: bash
@@ -120,14 +151,6 @@ jobs:
         run: |
           try { Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction Stop } catch { "Defender stays on: $_" }
       - uses: actions/checkout@v5
-        with:
-          fetch-depth: 2
-      - name: the release can be tagged
-        run: |
-          if ! git diff --quiet HEAD~1 HEAD -- "$(git rev-parse --show-toplevel)/.github/workflows" 2>/dev/null; then
-            echo "::error::$(git log -1 --format=%h) edits a workflow, and GitHub won't let CI tag it: commit anything else on top"
-            exit 1
-          fi
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ${{ inputs.working-directory }}
@@ -142,12 +165,9 @@ jobs:
             cargo install --locked --git https://github.com/Emmet-v15/v15-kit --tag "${{ inputs.kit-ref }}" --root ~/.v15-release v15-release
           echo "$HOME/.v15-release/bin" >> "$GITHUB_PATH"
       - name: stamp
-        id: stamp
         run: |
           if [ -n "${V15_TEST_MANIFEST_URL:-}${V15_TEST_PUBKEY:-}" ]; then echo "::error::a V15_TEST_* stamp would ship in the build"; exit 1; fi
-          build=$(date +%s)
-          echo "V15_BUILD_ID=$build" >> "$GITHUB_ENV"
-          { echo "build=$build"; echo "tag=${{ inputs.app }}-$build"; } >> "$GITHUB_OUTPUT"
+          echo "V15_BUILD_ID=${{ needs.tag.outputs.build }}" >> "$GITHUB_ENV"
       - name: build
         run: cargo build --release --locked -p "${{ inputs.package }}"
       - name: sign
@@ -179,7 +199,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: build
+    needs: [tag, build]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -192,26 +212,46 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ needs.build.outputs.tag }}
+          TAG: ${{ needs.tag.outputs.tag }}
           APP: ${{ inputs.app }}
         run: |
-          gh release create "$TAG" out/* --target "$GITHUB_SHA" \
-            --title "$APP ${{ needs.build.outputs.build }}" \
-            --notes "Built from ${GITHUB_REF_NAME} at ${GITHUB_SHA}. ${{ inputs.notes }}" --latest=false
+          # The tag already exists: uploading and editing do not touch
+          # the ref.
+          gh release upload "$TAG" out/*
+          gh release edit "$TAG" --prerelease=false --latest=false \
+            --title "$APP ${{ needs.tag.outputs.build }}" \
+            --notes "Built from ${GITHUB_REF_NAME} at ${GITHUB_SHA}. ${{ inputs.notes }}"
           # Retain the latest 5. Reinstalling an older version only affects
           # future downloads; already installed apps remain unchanged.
           gh release list --limit 100 --json tagName -q '.[].tagName' \
             | grep -E "^${APP}-[0-9]+$" | sort -t- -k2 -rn | tail -n +6 \
             | while read -r old; do gh release delete "$old" --cleanup-tag -y; done
 
+  # A failed build leaves an empty prerelease; remove it.
+  discard:
+    needs: [tag, build, release]
+    if: failure() && needs.tag.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: remove the empty release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.tag.outputs.tag }}
+        run: |
+          gh release delete "$TAG" --cleanup-tag -y \
+            || echo "::warning::couldn't remove $TAG; delete it by hand (gh release delete $TAG --cleanup-tag)"
+
   install:
-    needs: [build, release]
+    needs: [tag, release]
     if: inputs.publish
     runs-on: ubuntu-24.04
     permissions:
       contents: read # the token release-pull fetches the release with
     env:
-      TAG: ${{ needs.build.outputs.tag }}
+      TAG: ${{ needs.tag.outputs.tag }}
     steps:
       - name: install on the server
         env:
@@ -235,5 +275,5 @@ jobs:
           SITE: ${{ inputs.site }}
         run: |
           latest=$(curl -fsS "$SITE/manifest.json" | jq -r .latest)
-          [ "$latest" = "${{ needs.build.outputs.build }}" ] || { echo "::error::the live manifest's latest is $latest"; exit 1; }
+          [ "$latest" = "${{ needs.tag.outputs.build }}" ] || { echo "::error::the live manifest's latest is $latest"; exit 1; }
           echo "live: ${{ inputs.app }} build $latest"

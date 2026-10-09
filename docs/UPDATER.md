@@ -117,15 +117,21 @@ an app's build to a different app or platform, or roll an app back.
 
 ## Releasing
 
-`tauri-release.yml` (reusable): build with `V15_BUILD_ID` → `v15-release add`
+`tauri-release.yml` (reusable): the empty release `<app>-<build>` and its tag
+first → build with `V15_BUILD_ID` → `v15-release add`
 signs the exe into the live manifest plus this build and packs the `.br` →
-`v15-release verify` → `SHA256SUMS` → GitHub release `<app>-<build>` (newest 5
-kept) → the server's `release-pull <app> <tag>` installs the files where the
+`v15-release verify` → `SHA256SUMS` → the files uploaded and the release
+published (newest 5 kept) → the server's `release-pull <app> <tag>` installs the files where the
 app's config says (`/etc/release-pull/<app>.json`, installed with
 `ops/release-pull/install.sh`) → the live manifest is checked.
 
 Reinstalling an older release only affects what new downloads receive;
 installed apps never roll back.
+
+A run's token cannot create a tag on a commit if its workflow files differ
+from the default branch's. Therefore, the tag is created before the build,
+while the branch still matches. A commit that itself modifies a workflow
+still cannot be released from CI; place another commit on top.
 
 ## Moving an existing app onto the kit
 
