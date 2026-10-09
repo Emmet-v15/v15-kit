@@ -15,8 +15,11 @@ same way.
 - [ ] **lib.rs / main.rs split**: `main.rs` only calls `<app>_lib::run()`, and
   `run()` carries `#[cfg_attr(mobile, tauri::mobile_entry_point)]`.
 - [ ] **v15-shell**: `pre_gui(&SHELL)` first in `run()`,
-  `.plugin(plugin(&SHELL))` on the builder, and no other self-install,
-  single-instance or updater code.
+  `.plugin(plugin(&SHELL))` on the builder,
+  `.run(v15_shell::context(tauri::generate_context!()))`, and no other
+  self-install, single-instance or updater code.
+- [ ] **A dev launcher**: `scripts/<app>-dev.cmd` and its Start Menu shortcut
+  (below, "The dev launcher").
 - [ ] **Signed updates**: a key from `v15-release keygen` in `state/`
   (gitignored), its public half in `Config.pubkeys`, the private half in the
   `V15_UPDATE_KEY` secret. See UPDATER.md.
@@ -47,10 +50,42 @@ same way.
 |---|---|
 | manifest | `<site>/manifest.json` |
 | files | `<site>/<exe>` and `<exe>.br` |
+| download link | `https://v15.studio/<app>.exe`: the same exe at the site root, the one link to give people (a second `to` for the exe in the release-pull config, before the manifest) |
 | GitHub release | `<app>-<build id>` |
 | release-pull config | `/etc/release-pull/<app>.json` on the server, kept in the app's repo |
 | single instance | `Local\v15-<app>-instance` (`Global\` for machine-wide installs) |
 | uninstall entry | `HKCU\…\Uninstall\v15-<app>` (`HKLM` for machine-wide installs; `Config.uninstall_entry` keeps an older name) |
+| dev launcher | `scripts/<app>-dev.cmd`, and the Start Menu shortcut `<app>-dev` that runs it |
+| dev build's data | `<identifier>-dev` (its data, config, WebView2 and log folders) |
+
+## The dev launcher
+
+Every app has a Start Menu entry for its dev build, `<app>-dev`, next to the
+installed `<app>`: one click builds the debug app from its repo and runs it,
+starting the app's dev server first when it has one (star-dev's shape).
+
+1. Copy v15-kit's `scripts/app-dev.cmd` to `scripts/<app>-dev.cmd` in the
+   app's root (the folder holding `src-tauri/` or `tauri.conf.json`): set
+   `<app>`, the run line (`cargo run -p <package>`), and the dev-server line
+   or delete it.
+2. Make the shortcut, and again whenever the repo moves:
+   `powershell -NoProfile -File <v15-kit>\scripts\dev-shortcut.ps1 -Launcher scripts\<app>-dev.cmd`.
+   It is per user (`%APPDATA%\Microsoft\Windows\Start Menu\Programs`), named
+   after the launcher, and wears the app's `icon.ico`; `-Remove` takes it away.
+3. Add the launcher to the `dev` row of the app's AGENTS.md.
+
+The dev build runs beside the installed copy:
+
+| | installed (release) | dev (debug) |
+|---|---|---|
+| single instance | `Local\v15-<app>-instance` | none: it never takes the lock, so it neither blocks nor is blocked |
+| install, shortcuts, updates | yes | none |
+| data, config, WebView2, log | `%APPDATA%\<identifier>`, `%LOCALAPPDATA%\<identifier>` | the same with `<identifier>-dev`, through `v15_shell::context` |
+| product name, configured window titles | `<name>` | `<name> dev` |
+
+What an app keeps outside Tauri's folders (a hard-coded path, a registry key,
+a URL scheme, a fixed pipe name) is still shared: the app suffixes those
+itself when `v15_shell::dev()` is true.
 
 ## Not in the kit yet
 

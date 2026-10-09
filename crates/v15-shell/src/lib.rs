@@ -26,7 +26,7 @@
 //!     v15_shell::pre_gui(&SHELL); // may exit: installed elsewhere, or already running
 //!     tauri::Builder::default()
 //!         .plugin(v15_shell::plugin(&SHELL))
-//!         .run(tauri::generate_context!())
+//!         .run(v15_shell::context(tauri::generate_context!()))
 //!         .expect("error while running");
 //! }
 //! ```
@@ -34,6 +34,10 @@
 //! Debug builds, as well as any build executed with `V15_NO_BOOTSTRAP=1`, skip install,
 //! single-instance, and updates. This behavior is currently Windows-only; on other
 //! platforms, the plugin retains its commands but performs no other actions.
+//!
+//! A debug build is also the app's dev build ([`dev`]): when run through [`context`],
+//! its identifier gains [`DEV_SUFFIX`], meaning its data, WebView2 profile, and log are
+//! separate, and it runs alongside the installed copy.
 
 mod commands;
 pub mod defender;
@@ -296,7 +300,8 @@ impl Config {
         base.unwrap_or_else(std::env::temp_dir).join(folder)
     }
 
-    /// Tauri's app_log_dir on Windows; usable before Tauri starts.
+    /// Tauri's app_log_dir on Windows, usable before Tauri starts. A dev
+    /// build's is its own (`<identifier>-dev`).
     pub fn log_dir(&self) -> PathBuf {
         if let Some(root) = self.test_root() {
             return root.join("logs");
@@ -304,8 +309,50 @@ impl Config {
         std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir)
-            .join(self.identifier)
+            .join(identifier_for(self.identifier, dev()))
             .join("logs")
+    }
+}
+
+/// The suffix a dev build appends to the app's identifier, so its data,
+/// config, WebView2 folders, and logs are stored apart from the installed
+/// copy's.
+pub const DEV_SUFFIX: &str = "-dev";
+
+/// A dev build is any debug build (`cargo run`, the app's `<app>-dev`
+/// launcher). It does not acquire a single-instance lock, does not
+/// install anything, never updates, and maintains its own data via
+/// [`context`].
+pub fn dev() -> bool {
+    cfg!(debug_assertions)
+}
+
+fn identifier_for(identifier: &str, dev: bool) -> String {
+    if dev {
+        format!("{identifier}{DEV_SUFFIX}")
+    } else {
+        identifier.to_string()
+    }
+}
+
+/// The app's context: `.run(v15_shell::context(tauri::generate_context!()))`.
+/// In a dev build, the identifier includes [`DEV_SUFFIX`] (causing every
+/// folder Tauri derives from it to move), and the product name and configured
+/// window titles include " dev". A release build's context is unchanged.
+pub fn context<R: Runtime>(mut ctx: tauri::Context<R>) -> tauri::Context<R> {
+    if dev() {
+        dev_config(ctx.config_mut());
+    }
+    ctx
+}
+
+fn dev_config(c: &mut tauri::Config) {
+    c.identifier = identifier_for(&c.identifier, true);
+    if let Some(name) = &mut c.product_name {
+        name.push_str(" dev");
+    }
+    for w in &mut c.app.windows {
+        w.title.push_str(" dev");
     }
 }
 
@@ -403,5 +450,32 @@ mod tests {
     #[should_panic]
     fn a_bad_build_id_is_refused() {
         parse_build(Some("17914x"));
+    }
+
+    #[test]
+    fn a_dev_build_keeps_its_own_data_and_titles() {
+        let mut c: tauri::Config = serde_json::from_value(serde_json::json!({
+            "identifier": "com.example.myapp",
+            "productName": "My App",
+            "app": { "windows": [{ "label": "main", "title": "My App" }] }
+        }))
+        .unwrap();
+        dev_config(&mut c);
+        assert_eq!(c.identifier, "com.example.myapp-dev");
+        assert_eq!(c.product_name.as_deref(), Some("My App dev"));
+        assert_eq!(c.app.windows[0].title, "My App dev");
+    }
+
+    #[test]
+    fn a_dev_build_logs_beside_its_own_data() {
+        assert_eq!(identifier_for("com.example.myapp", false), "com.example.myapp");
+        assert_eq!(identifier_for("com.example.myapp", true), "com.example.myapp-dev");
+        // tests are debug builds, so this config logs as a dev build
+        let cfg = Config {
+            identifier: "com.example.myapp",
+            ..Config::DEFAULT
+        };
+        let dir = cfg.log_dir();
+        assert!(dir.ends_with("com.example.myapp-dev/logs"), "{}", dir.display());
     }
 }

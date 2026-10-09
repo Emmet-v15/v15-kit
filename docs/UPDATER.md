@@ -125,6 +125,17 @@ published (newest 5 kept) → the server's `release-pull <app> <tag>` installs t
 app's config says (`/etc/release-pull/<app>.json`, installed with
 `ops/release-pull/install.sh`) → the live manifest is checked.
 
+Each app also gets a stable download link, `https://v15.studio/<app>.exe`:
+its release-pull config installs the exe a second time at the site root,
+listed after the app's own files and before its manifest:
+
+```json
+{"asset": "myapp.exe", "to": "/var/www/v15.studio/myapp/myapp.exe", "owner": "nginx:nginx"},
+{"asset": "myapp.exe.br", "to": "/var/www/v15.studio/myapp/myapp.exe.br", "owner": "nginx:nginx"},
+{"asset": "myapp.exe", "to": "/var/www/v15.studio/myapp.exe", "owner": "nginx:nginx"},
+{"asset": "manifest.json", "to": "/var/www/v15.studio/myapp/manifest.json", "owner": "nginx:nginx"}
+```
+
 Reinstalling an older release only affects what new downloads receive;
 installed apps never roll back.
 

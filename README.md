@@ -11,6 +11,7 @@ the tool for signing those builds and the CI workflows for releasing them.
 | [`crates/v15-release`](crates/v15-release) | the signing CLI: `keygen`, `add` (sign a build into a manifest), `verify`, `sums` |
 | [`ops/release-pull`](ops/release-pull) | installs a GitHub release's files on a server, from CI over a restricted SSH key |
 | [`.github/workflows`](.github/workflows) | `tauri-ci.yml` and `tauri-release.yml`, called from each app's own workflows |
+| [`scripts`](scripts) | the dev launcher: `app-dev.cmd` (the app's `scripts/<app>-dev.cmd` template) and `dev-shortcut.ps1` (its `<app>-dev` Start Menu shortcut) |
 | [`docs/UPDATER.md`](docs/UPDATER.md) | how updates work: the manifest, signatures, keys, releasing, testing |
 | [`docs/STANDARD.md`](docs/STANDARD.md) | the checklist an app on the kit follows |
 
@@ -20,7 +21,7 @@ the tool for signing those builds and the CI workflows for releasing them.
 # src-tauri/Cargo.toml
 [dependencies]
 tauri = { version = "=2.12.1", features = [] }
-v15-shell = { git = "https://github.com/Emmet-v15/v15-kit", tag = "v0.5.1" }
+v15-shell = { git = "https://github.com/Emmet-v15/v15-kit", tag = "v0.6.0" }
 ```
 
 ```rust
@@ -43,13 +44,28 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(v15_shell::plugin(&SHELL))
         // ...
-        .run(tauri::generate_context!())
+        .run(v15_shell::context(tauri::generate_context!())) // a dev build's data is its own
         .expect("error while running");
 }
 ```
 
 `capabilities/default.json` lists `v15-shell:default`, and a page can call
 `invoke('plugin:v15-shell|info')` and `invoke('plugin:v15-shell|check')`.
+
+## The dev build
+
+A debug build is the app's development build: it installs nothing, never
+updates, does not take a single-instance lock, and (via `v15_shell::context`)
+stores its data, WebView2 profile, and logs under `<identifier>-dev`, allowing
+it to run alongside the installed copy. Each app launches it from the Start
+Menu as `<app>-dev`:
+
+```powershell
+copy <v15-kit>\scripts\app-dev.cmd scripts\myapp-dev.cmd   # then set the app and its run line
+powershell -NoProfile -File <v15-kit>\scripts\dev-shortcut.ps1 -Launcher scripts\myapp-dev.cmd
+```
+
+Refer to [docs/STANDARD.md](docs/STANDARD.md#the-dev-launcher).
 
 Other `Config` options:
 
