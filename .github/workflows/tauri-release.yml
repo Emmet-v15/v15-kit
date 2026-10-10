@@ -6,7 +6,7 @@ name: tauri-release
 #   on: workflow_dispatch
 #   jobs:
 #     release:
-#       uses: Emmet-v15/v15-kit/.github/workflows/tauri-release.yml@v0.6.0
+#       uses: Emmet-v15/v15-kit/.github/workflows/tauri-release.yml@v0.6.1
 #       with:
 #         app: myapp
 #         package: myapp-app
@@ -29,7 +29,8 @@ name: tauri-release
 #    it into the live manifest plus this build (v15-release add, which refuses
 #    a key the app doesn't trust), packs the .br and writes SHA256SUMS.
 # 3. release: uploads the files to that release and publishes it; the
-#    newest 5 are kept. A failed build removes the empty release.
+#    newest 5 are kept. A failed or cancelled run removes the release while
+#    it is still an unpublished prerelease, never once published.
 # 4. install: the server's release-pull (ops/release-pull) fetches that
 #    release with this run's read-only token and puts the files where its
 #    config for the app says; then the live manifest at <site>/manifest.json
@@ -83,7 +84,7 @@ on:
       kit-ref:
         description: The v15-kit tag whose v15-release signs
         type: string
-        default: v0.6.0
+        default: v0.6.1
       notes:
         type: string
         default: ""
@@ -101,6 +102,13 @@ on:
         value: ${{ jobs.tag.outputs.tag }}
 
 permissions: {}
+
+# One release per app at a time: each signs into the live manifest and
+# installs it, so overlapping runs could roll it back. A queued run waits
+# (a newer one takes its place in the queue).
+concurrency:
+  group: v15-release-${{ inputs.app }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: never
@@ -214,33 +222,55 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.tag.outputs.tag }}
           APP: ${{ inputs.app }}
+          BUILD: ${{ needs.tag.outputs.build }}
+          NOTES: ${{ inputs.notes }}
         run: |
           # The tag already exists: uploading and editing do not touch
           # the ref.
           gh release upload "$TAG" out/*
           gh release edit "$TAG" --prerelease=false --latest=false \
-            --title "$APP ${{ needs.tag.outputs.build }}" \
-            --notes "Built from ${GITHUB_REF_NAME} at ${GITHUB_SHA}. ${{ inputs.notes }}"
-          # Retain the latest 5. Reinstalling an older version only affects
-          # future downloads; already installed apps remain unchanged.
+            --title "$APP $BUILD" \
+            --notes "Built from ${GITHUB_REF_NAME} at ${GITHUB_SHA}. $NOTES"
+      # Best effort: the release is out, and a failure here must not fail
+      # the job (discard would then remove it).
+      - name: keep the newest 5
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          APP: ${{ inputs.app }}
+        run: |
+          # Reinstalling an older version only affects future downloads;
+          # already installed apps remain unchanged.
           gh release list --limit 100 --json tagName -q '.[].tagName' \
             | grep -E "^${APP}-[0-9]+$" | sort -t- -k2 -rn | tail -n +6 \
-            | while read -r old; do gh release delete "$old" --cleanup-tag -y; done
+            | while read -r old; do
+                gh release delete "$old" --cleanup-tag -y || echo "::warning::couldn't remove $old"
+              done
 
-  # A failed build leaves an empty prerelease; remove it.
+  # If a run fails or is cancelled, an unpublished prerelease remains;
+  # delete it, but do not delete any published release.
   discard:
     needs: [tag, build, release]
-    if: failure() && needs.tag.result == 'success'
+    if: (failure() || cancelled()) && needs.tag.result == 'success'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - name: remove the empty release
+      - name: remove the unpublished release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.tag.outputs.tag }}
         run: |
+          if ! pre=$(gh release view "$TAG" --json isPrerelease -q .isPrerelease); then
+            echo "::warning::couldn't read $TAG; if it is still a prerelease, delete it by hand (gh release delete $TAG --cleanup-tag)"
+            exit 0
+          fi
+          if [ "$pre" != "true" ]; then
+            echo "$TAG is published; keeping it"
+            exit 0
+          fi
           gh release delete "$TAG" --cleanup-tag -y \
             || echo "::warning::couldn't remove $TAG; delete it by hand (gh release delete $TAG --cleanup-tag)"
 

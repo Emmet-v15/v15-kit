@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/v15-update", "crates/v15-release", "crates/v15-shell"]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 rust-version = "1.90"
 license = "UNLICENSED"

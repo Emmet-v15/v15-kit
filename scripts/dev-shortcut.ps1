@@ -17,7 +17,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
-$Launcher = (Resolve-Path -LiteralPath $Launcher).Path
+$Launcher = (Resolve-Path -LiteralPath $Launcher).ProviderPath
 $root = Split-Path (Split-Path $Launcher)
 if (-not $Name) { $Name = [IO.Path]::GetFileNameWithoutExtension($Launcher) }
 $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) "$Name.lnk"
@@ -40,6 +40,6 @@ $s.TargetPath = $Launcher
 $s.Arguments = ''
 $s.WorkingDirectory = $root
 $s.Description = "$Name`: the dev build, from $root"
-$s.IconLocation = if ($Icon) { "$((Resolve-Path -LiteralPath $Icon).Path),0" } else { '' }
+$s.IconLocation = if ($Icon) { "$((Resolve-Path -LiteralPath $Icon).ProviderPath),0" } else { '' }
 $s.Save()
 "$lnk -> $Launcher"

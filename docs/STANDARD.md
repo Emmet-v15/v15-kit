@@ -84,8 +84,11 @@ The dev build runs beside the installed copy:
 | product name, configured window titles | `<name>` | `<name> dev` |
 
 What an app keeps outside Tauri's folders (a hard-coded path, a registry key,
-a URL scheme, a fixed pipe name) is still shared: the app suffixes those
-itself when `v15_shell::dev()` is true.
+a URL scheme, a fixed pipe name) remains shared: the app appends its own
+suffix to these when `v15_shell::dev()` is true. This applies to
+`Config.webview_dir` as well: the returned folder belongs to the app, so the
+app also suffixes it. `Config.defender` is ignored in dev builds, so
+`defender::ensure` never prompts there.
 
 ## Not in the kit yet
 

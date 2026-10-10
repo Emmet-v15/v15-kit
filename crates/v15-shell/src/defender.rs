@@ -1,9 +1,10 @@
 //! Microsoft Defender exclusions for the app's folders (`Config.defender`)
-//! are requested via a single UAC prompt at startup and whenever the app
-//! requests them again (via a "fix it" button). The exclusions applied and
-//! the user's refusal are stored in `<identifier>\defender.json`, as
-//! reading Defender's native list requires administrator privileges. Builds
-//! marked for local testing never prompt.
+//! are requested through a single UAC prompt at startup and when the app
+//! requests them again (via a "fix it" button). The applied exclusions and
+//! user refusals are stored in `<identifier>\defender.json` because reading
+//! Defender's native list requires administrator privileges. Builds marked
+//! for local testing never prompt, and a dev build ([`crate::dev`]) leaves
+//! Defender alone: nothing is missing, and nothing is asked.
 
 use crate::config;
 use std::path::PathBuf;
@@ -40,8 +41,16 @@ fn norm(p: &str) -> String {
 }
 
 fn wanted() -> Vec<String> {
-    config()
-        .defender
+    wanted_in(config().defender, crate::dev())
+}
+
+// The folders originate from the app and, in a dev build, may still be the
+// installed copy's; a dev build never requests an elevated change.
+fn wanted_in(folders: Option<fn() -> Vec<PathBuf>>, dev: bool) -> Vec<String> {
+    if dev {
+        return Vec::new();
+    }
+    folders
         .map(|f| f())
         .unwrap_or_default()
         .iter()
@@ -213,5 +222,15 @@ mod tests {
     #[test]
     fn paths_compare_loosely() {
         assert_eq!(super::norm(r"C:\Games\"), super::norm(r"c:\games"));
+    }
+
+    #[test]
+    fn a_dev_build_asks_for_nothing() {
+        fn folders() -> Vec<std::path::PathBuf> {
+            vec![std::path::PathBuf::from(r"C:\Games")]
+        }
+        assert!(super::wanted_in(Some(folders), true).is_empty());
+        assert_eq!(super::wanted_in(Some(folders), false), vec![r"C:\Games".to_string()]);
+        assert!(super::wanted_in(None, false).is_empty());
     }
 }

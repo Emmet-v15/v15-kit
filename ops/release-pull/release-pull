@@ -41,11 +41,12 @@ Whoever holds the key gets only what GitHub serves for the configured repo
 under an allowed tag: a token they send can let release-pull read, never
 change what it reads.
 
-Every asset it installs must be in the release's SHA256SUMS (sha256sum's
-format) and match. Archives are extracted with Python's "data" filter: no
-absolute paths, no "..", no links out, no device files or setuid bits.
-List manifests and version files last: clients see a new build only once its
-files are in place.
+Installed assets must be listed in the release's SHA256SUMS (in sha256sum
+format) with matching hashes. Archives are extracted using Python's "data"
+filter, which blocks absolute paths, "..", links pointing outside, device
+files, and setuid bits; Python versions lacking the 2025 fixes for this filter
+are rejected. List manifests and version files last so clients detect a new
+build only after its files are in place.
 
 Run by hand (as a sudoer):
     release-pull <app> <tag>                  what CI does
@@ -61,10 +62,13 @@ Each run is logged to /var/log/release-pull.log as well as printed.
 """
 
 import fcntl
+import grp
 import hashlib
 import json
 import os
+import pwd
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -75,7 +79,13 @@ import urllib.request
 
 CONFIG_DIR = "/etc/release-pull"
 LOG = "/var/log/release-pull.log"
+LOCK_DIR = "/run/release-pull"
 SUMS = "SHA256SUMS"
+# Before these releases (CVE-2025-4517 and others), the "data" filter could
+# be bypassed. The fix also added os.path.ALLOW_MISSING, allowing a
+# distribution's patched build of an older release to pass.
+TARFILE_FIXED = {(3, 9): (3, 9, 23), (3, 10): (3, 10, 18), (3, 11): (3, 11, 13),
+                 (3, 12): (3, 12, 11), (3, 13): (3, 13, 4)}
 
 
 class Refused(Exception):
@@ -239,30 +249,89 @@ def verify(workdir, names):
 
 
 # ── installing ──────────────────────────────────────────────────────────────
+#
+# Root writes to directories that may also be writable by their owner (such as
+# nginx), so no operation here follows a link that the owner could have
+# planted. Temporary files are created with random names and the
+# O_EXCL|O_NOFOLLOW flags, and ownership changes never traverse a link.
 
-def chown_tree(path, owner):
+def owner_ids(owner):
     if not owner:
-        return
+        return None
     user, _, group = owner.partition(":")
-    shutil.chown(path, user, group or None)
-    if os.path.isdir(path) and not os.path.islink(path):
-        for root, dirs, files in os.walk(path):
-            for n in dirs + files:
-                shutil.chown(os.path.join(root, n), user, group or None)
+    return pwd.getpwnam(user).pw_uid, grp.getgrnam(group).gr_gid if group else -1
+
+
+def tarfile_safe(version=None, patched=None):
+    version = tuple(version or sys.version_info[:3])
+    fixed = TARFILE_FIXED.get(version[:2], (3, 14, 0) if version >= (3, 14) else None)
+    if patched is None:
+        patched = hasattr(os.path, "ALLOW_MISSING")
+    return patched or (fixed is not None and version >= fixed)
+
+
+def chown_tree(path, ids):
+    # For a tree with no other writers yet: children before the top, links
+    # themselves rather than their targets, and never into a linked folder.
+    if not ids:
+        return
+    for root, dirs, files in os.walk(path, topdown=False):
+        for n in dirs + files:
+            os.chown(os.path.join(root, n), *ids, follow_symlinks=False)
+    os.chown(path, *ids, follow_symlinks=False)
+
+
+def chown_under(top, rel, ids):
+    # top/rel, in a folder its owner can write to: each folder on the path
+    # is opened without following links, so a link swapped in there fails
+    # instead of redirecting the change.
+    parts = [p for p in rel.split("/") if p not in ("", ".")]
+    fd = os.open(top, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for p in parts[:-1]:
+            sub = os.open(p, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            os.close(fd)
+            fd = sub
+        os.chown(parts[-1] if parts else ".", *ids, dir_fd=fd, follow_symlinks=False)
+    finally:
+        os.close(fd)
 
 
 def install_file(src, dest, owner):
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-    # Writes to the destination folder, so it inherits that folder's
-    # SELinux label, and the rename is atomic.
-    tmp = os.path.join(os.path.dirname(dest), f".{os.path.basename(dest)}.release-pull")
-    shutil.copyfile(src, tmp)
-    os.chmod(tmp, 0o644)
-    chown_tree(tmp, owner)
-    os.replace(tmp, dest)
+    folder, name = os.path.split(dest)
+    os.makedirs(folder, exist_ok=True)
+    ids = owner_ids(owner)
+    # The file is written to the destination folder, inheriting its
+    # SELinux label, and the rename operation is atomic.
+    d = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        tmp = f".{name}.{secrets.token_hex(8)}.release-pull"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=d)
+        try:
+            with os.fdopen(fd, "wb") as out, open(src, "rb") as f:
+                shutil.copyfileobj(f, out, 1 << 20)
+                os.fchmod(out.fileno(), 0o644)
+                if ids:
+                    os.fchown(out.fileno(), *ids)
+            os.replace(tmp, name, src_dir_fd=d, dst_dir_fd=d)
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=d)
+            except FileNotFoundError:
+                pass
+            raise
+    finally:
+        os.close(d)
+
+
+def require_safe_tarfile():
+    if not tarfile_safe():
+        raise Refused(f"Python {sys.version.split()[0]} predates the tarfile fixes "
+                      f"(3.9.23, 3.10.18, 3.11.13, 3.12.11, 3.13.4): run release-pull with a newer python3")
 
 
 def extract(archive, into):
+    require_safe_tarfile()
     with tarfile.open(archive, "r:*") as t:
         t.extractall(into, filter="data")
         return [m.name for m in t.getmembers()]
@@ -279,7 +348,7 @@ def replace_dir(archive, dest, owner):
         extract(archive, new)
         if os.path.isdir(dest):
             shutil.copystat(dest, new)  # the folder keeps its mode
-        chown_tree(new, owner)
+        chown_tree(new, owner_ids(owner))
     except BaseException:
         shutil.rmtree(new, ignore_errors=True)
         raise
@@ -291,10 +360,13 @@ def replace_dir(archive, dest, owner):
 
 def unpack_into(archive, dest, owner):
     os.makedirs(dest, exist_ok=True)
+    ids = owner_ids(owner)
     for member in extract(archive, dest):
-        if owner:  # what the archive brought, not the rest of the folder
-            user, _, group = owner.partition(":")
-            shutil.chown(os.path.join(dest, member), user, group or None)
+        if ids:  # what the archive brought, not the rest of the folder
+            try:
+                chown_under(dest, member, ids)
+            except OSError as e:
+                log(f"  left {member} owned by root: {e}")
 
 
 def relabel(paths):
@@ -303,12 +375,21 @@ def relabel(paths):
         subprocess.run(["restorecon", "-R", *paths], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def take_lock(app):
+    # One execution per app at a time; retained until the process exits.
+    os.makedirs(LOCK_DIR, 0o700, exist_ok=True)
+    fd = os.open(os.path.join(LOCK_DIR, f"{app}.lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
 def run(app, tag, assets_dir, check):
     conf = load_config(app)
     if not re.fullmatch(conf["tag"], tag):
         raise Refused(f"{tag!r} is not a {app} release tag ({conf['tag']})")
-    lock = open(f"/run/lock/release-pull-{app}.lock", "w")
-    fcntl.flock(lock, fcntl.LOCK_EX)
+    if any("to" not in e for e in conf["files"]):
+        require_safe_tarfile()  # prior to any retrieval or installation
+    take_lock(app)
     t0 = time.time()
     log(f"{app}: {'checking' if check else 'installing'} {tag} from {assets_dir or conf['repo']}")
     names = {e["asset"] for e in conf["files"]}

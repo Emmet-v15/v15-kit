@@ -189,12 +189,14 @@ pub struct Config {
     /// front; the app then displays what it requires (a `myapp://` link, for
     /// example).
     pub forward_launch: bool,
-    /// The webview data folder for apps whose windows set their own; the
-    /// splash uses it too.
+    /// The webview data folder for apps where windows set their own; the
+    /// splash also uses it. [`context`] does not move it: in a dev build
+    /// ([`dev`]), the app's function adds [`DEV_SUFFIX`] itself.
     pub webview_dir: Option<fn() -> PathBuf>,
-    /// Folders that Microsoft Defender should leave alone (the app's data,
-    /// its downloads). The app calls `defender::ensure(false)` after
-    /// `pre_gui`: one UAC prompt for whatever is missing ([`defender`]).
+    /// Folders Microsoft Defender should ignore (the app's data and its
+    /// downloads). The app calls `defender::ensure(false)` after
+    /// `pre_gui`: one UAC prompt for whatever is missing ([`defender`]). A
+    /// dev build never asks.
     pub defender: Option<fn() -> Vec<PathBuf>>,
     pub first_check: Duration,
     pub check_every: Duration,

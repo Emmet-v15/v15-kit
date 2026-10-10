@@ -39,8 +39,11 @@ tar czf - -C "$tmp" release-pull "$APP.json" | ssh "$HOST" "set -e
 echo "release-pull and /etc/release-pull/$APP.json installed on $HOST"
 
 if [ -n "$KEY" ]; then
-  PUB=$(cat "$KEY")
-  case "$PUB" in ssh-ed25519\ *|ssh-rsa\ *|ecdsa-*) ;; *) echo "$KEY is not a public key"; exit 1 ;; esac
+  PUB=$(tr -d '\r' < "$KEY")
+  # Exactly one key, on one line: a second line would be authorized
+  # without the restriction.
+  [[ "$PUB" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp[0-9]+)\ [A-Za-z0-9+/]+=*(\ [[:print:]]*)?$ ]] \
+    || { echo "$KEY is not a single-line public key"; exit 1; }
   LINE="command=\"/usr/local/bin/release-pull $APP\",restrict $PUB"
   printf '%s\n' "$LINE" | ssh "$HOST" "set -e
     f=~/.ssh/authorized_keys; cp \"\$f\" \"\$f.bak-release-pull\"

@@ -139,6 +139,13 @@ listed after the app's own files and before its manifest:
 Reinstalling an older release only affects what new downloads receive;
 installed apps never roll back.
 
+A known gap: release-pull checks each file against the release's
+`SHA256SUMS`, not against the manifest's signature. Installed apps verify
+every update, but anyone who can publish a release in the app's repo can
+place an unsigned exe at the download link for new users. Verifying it on
+the server would require an Ed25519 library or OpenSSL there, and the app's
+public key in its release-pull config.
+
 A run's token cannot create a tag on a commit if its workflow files differ
 from the default branch's. Therefore, the tag is created before the build,
 while the branch still matches. A commit that itself modifies a workflow
