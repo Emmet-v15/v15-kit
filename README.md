@@ -21,7 +21,7 @@ the tool for signing those builds and the CI workflows for releasing them.
 # src-tauri/Cargo.toml
 [dependencies]
 tauri = { version = "=2.12.1", features = [] }
-v15-shell = { git = "https://github.com/Emmet-v15/v15-kit", tag = "v0.6.1" }
+v15-shell = { git = "https://github.com/Emmet-v15/v15-kit", tag = "v0.6.2" }
 ```
 
 ```rust

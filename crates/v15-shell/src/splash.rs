@@ -6,9 +6,18 @@
 
 use crate::{Config, Splash};
 use std::time::Duration;
+use tauri::webview::PageLoadEvent;
+use tauri::window::Color;
 use tauri::{AppHandle, Manager, Runtime, WebviewUrl, WebviewWindowBuilder};
 
 pub(crate) const LABEL: &str = "v15-splash";
+
+/// Shown under the page until it renders. WebView2 defaults to a white background,
+/// and since a new webview often takes longer to paint than a small update takes to download,
+/// the splash screen displayed only white.
+const BACKGROUND: Color = Color(13, 15, 18, 255);
+/// How long to wait for the page before showing the window and starting the download anyway.
+const LOAD_WAIT: Duration = Duration::from_secs(3);
 
 const PAGE: &str = r#"<!doctype html><html><head><meta charset="utf-8"><style>
 html,body{margin:0;height:100%;background:#0d0f12;color:#e8eaed;font:14px/1.4 system-ui,"Segoe UI",sans-serif;
@@ -76,8 +85,21 @@ pub(crate) fn show<R: Runtime>(app: &AppHandle<R>, cfg: &Config, version: &str) 
     let title = cfg.name.to_string();
     let webview_dir = cfg.webview_dir;
     let (tx, rx) = std::sync::mpsc::channel();
+    let (loaded_tx, loaded_rx) = std::sync::mpsc::channel::<()>();
     let _ = app.run_on_main_thread(move || {
-        let mut builder = WebviewWindowBuilder::new(&handle, LABEL, url);
+        // hidden until the page loads, then shown painted: never a white window
+        let loaded_tx = std::sync::Mutex::new(Some(loaded_tx));
+        let mut builder = WebviewWindowBuilder::new(&handle, LABEL, url)
+            .visible(false)
+            .background_color(BACKGROUND)
+            .on_page_load(move |w, payload| {
+                if payload.event() == PageLoadEvent::Finished {
+                    let _ = w.show();
+                    if let Some(tx) = loaded_tx.lock().ok().and_then(|mut t| t.take()) {
+                        let _ = tx.send(());
+                    }
+                }
+            });
         if let Some(dir) = webview_dir {
             builder = builder.data_directory(dir());
         }
@@ -100,7 +122,14 @@ pub(crate) fn show<R: Runtime>(app: &AppHandle<R>, cfg: &Config, version: &str) 
         let _ = tx.send(built.map(|_| ()).map_err(|e| e.to_string()));
     });
     match rx.recv_timeout(Duration::from_secs(10)) {
-        Ok(Ok(())) => std::thread::sleep(Duration::from_millis(300)), // let it define progress()
+        // The loaded page has defined progress(); a page that never loads still gets its window
+        Ok(Ok(())) => {
+            if loaded_rx.recv_timeout(LOAD_WAIT).is_err() {
+                if let Some(w) = app.get_webview_window(LABEL) {
+                    let _ = w.show();
+                }
+            }
+        }
         Ok(Err(e)) => crate::log(format!("no splash: {e}")),
         Err(_) => crate::log("no splash: timed out"),
     }
